@@ -1,0 +1,58 @@
+asyncapi: 3.0.0
+info:
+  title: Gesture Broadcast API
+  version: 1.0.0
+  description: API do przesyłania danych o gestach przez WebSockets.
+
+servers:
+  local:
+    host: localhost:8080
+    protocol: ws
+
+channels:
+  gestureChannel:
+    address: /ws
+    summary: Główny kanał komunikacji dla gestów.
+    messages:
+      gestureUpdate:
+        $ref: '#/components/messages/GestureUpdate'
+
+operations:
+  sendGesture:
+    action: send
+    channel: 
+      $ref: '#/channels/gestureChannel'
+    summary: Klient wysyła dane o gestach (6 kątów).
+    
+  receiveBroadcast:
+    action: receive
+    channel: 
+      $ref: '#/channels/gestureChannel'
+    summary: Serwer rozsyła dane do wszystkich podłączonych klientów.
+
+components:
+  messages:
+    GestureUpdate:
+      name: GestureUpdate
+      title: Aktualizacja gestu
+      payload:
+        $ref: '#/components/schemas/GestureData'
+  
+  schemas:
+    GestureData:
+      type: object
+      properties:
+        angles:
+          type: array
+          items:
+            type: number
+            minimum: 0
+            maximum: 180
+          minItems: 6
+          maxItems: 6
+        timestamp:
+          type: number
+          description: "Unix timestamp (float64)"
+      required:
+        - angles
+        - timestamp
