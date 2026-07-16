@@ -16,6 +16,12 @@ channels:
     messages:
       gestureUpdate:
         $ref: '#/components/messages/GestureUpdate'
+  listenerChannel:
+    address: /listen
+    summary: Kanał tylko do nasłuchiwania poprawnych danych o kątach.
+    messages:
+      gestureUpdate:
+        $ref: '#/components/messages/GestureUpdate'
 
 operations:
   sendGesture:
@@ -29,6 +35,11 @@ operations:
     channel: 
       $ref: '#/channels/gestureChannel'
     summary: Serwer rozsyła dane do wszystkich podłączonych klientów.
+  listenForGestures:
+    action: receive
+    channel:
+      $ref: '#/channels/listenerChannel'
+    summary: Klient (np. Bruno) nasłuchuje kątów bez wysyłania wiadomości.
 
 components:
   messages:
