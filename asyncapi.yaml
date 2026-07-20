@@ -1,69 +1,145 @@
 asyncapi: 3.0.0
 info:
-  title: Gesture Broadcast API
-  version: 1.0.0
-  description: API do przesyłania danych o gestach przez WebSockets.
+  title: Session Manipulator Streaming API
+  version: 2.0.0
+  description: Sesyjny transport obrazu browser-Python i kątów Python-Unity.
 
 servers:
   local:
     host: localhost:8080
     protocol: ws
+  production:
+    host: websocket-inzynierka.onrender.com
+    protocol: wss
 
 channels:
-  gestureChannel:
-    address: /ws
-    summary: Główny kanał komunikacji dla gestów.
+  browser:
+    address: /ws/browser?token={token}
+    parameters:
+      token:
+        description: Token browsera zwrócony przez POST /api/sessions.
     messages:
-      gestureUpdate:
-        $ref: '#/components/messages/GestureUpdate'
-  listenerChannel:
-    address: /listen
-    summary: Kanał tylko do nasłuchiwania poprawnych danych o kątach.
+      jpegFrame:
+        $ref: '#/components/messages/JpegFrame'
+      status:
+        $ref: '#/components/messages/Status'
+  python:
+    address: /ws/python?token={token}
+    parameters:
+      token:
+        description: Token roli python zwrócony przez POST /api/sessions/pair.
     messages:
-      gestureUpdate:
-        $ref: '#/components/messages/GestureUpdate'
+      jpegFrame:
+        $ref: '#/components/messages/JpegFrame'
+      angles:
+        $ref: '#/components/messages/Angles'
+      source:
+        $ref: '#/components/messages/Source'
+  unity:
+    address: /ws/unity?token={token}
+    parameters:
+      token:
+        description: Token roli unity zwrócony przez POST /api/sessions/pair.
+    messages:
+      angles:
+        $ref: '#/components/messages/Angles'
 
 operations:
-  sendGesture:
+  browserSendsJPEG:
     action: send
-    channel: 
-      $ref: '#/channels/gestureChannel'
-    summary: Klient wysyła dane o gestach (6 kątów).
-    
-  receiveBroadcast:
-    action: receive
-    channel: 
-      $ref: '#/channels/gestureChannel'
-    summary: Serwer rozsyła dane do wszystkich podłączonych klientów.
-  listenForGestures:
+    channel:
+      $ref: '#/channels/browser'
+    messages:
+      - $ref: '#/channels/browser/messages/jpegFrame'
+  browserReceivesStatus:
     action: receive
     channel:
-      $ref: '#/channels/listenerChannel'
-    summary: Klient (np. Bruno) nasłuchuje kątów bez wysyłania wiadomości.
+      $ref: '#/channels/browser'
+    messages:
+      - $ref: '#/channels/browser/messages/status'
+  pythonReceivesJPEG:
+    action: receive
+    channel:
+      $ref: '#/channels/python'
+    messages:
+      - $ref: '#/channels/python/messages/jpegFrame'
+  pythonSendsAngles:
+    action: send
+    channel:
+      $ref: '#/channels/python'
+    messages:
+      - $ref: '#/channels/python/messages/angles'
+  pythonSelectsSource:
+    action: send
+    channel:
+      $ref: '#/channels/python'
+    messages:
+      - $ref: '#/channels/python/messages/source'
+  unityReceivesAngles:
+    action: receive
+    channel:
+      $ref: '#/channels/unity'
+    messages:
+      - $ref: '#/channels/unity/messages/angles'
 
 components:
   messages:
-    GestureUpdate:
-      name: GestureUpdate
-      title: Aktualizacja gestu
+    JpegFrame:
+      name: JpegFrame
+      contentType: image/jpeg
       payload:
-        $ref: '#/components/schemas/GestureData'
-  
+        type: string
+        format: binary
+        maxLength: 204800
+    Angles:
+      name: Angles
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/AnglesPayload'
+    Source:
+      name: Source
+      contentType: application/json
+      payload:
+        type: object
+        required: [type, source]
+        properties:
+          type:
+            const: source
+          source:
+            enum: [local_camera, web_camera]
+    Status:
+      name: Status
+      contentType: application/json
+      payload:
+        type: object
+        required: [type, python, unity, source]
+        properties:
+          type:
+            const: status
+          python:
+            type: boolean
+          unity:
+            type: boolean
+          source:
+            type: string
+
   schemas:
-    GestureData:
+    AnglesPayload:
       type: object
+      required: [type, angles, timestamp, sequence]
       properties:
+        type:
+          const: angles
         angles:
           type: array
+          minItems: 6
+          maxItems: 6
           items:
             type: number
             minimum: 0
             maximum: 180
-          minItems: 6
-          maxItems: 6
         timestamp:
           type: number
-          description: "Unix timestamp (float64)"
-      required:
-        - angles
-        - timestamp
+        sequence:
+          type: integer
+          minimum: 1
