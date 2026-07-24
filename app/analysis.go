@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -27,6 +28,11 @@ type httpAnalysisService struct {
 }
 
 func newHTTPAnalysisService(url, token string) analysisService {
+	if url == "" {
+		if hostport := strings.TrimSpace(os.Getenv("ANALYSIS_SERVICE_HOSTPORT")); hostport != "" {
+			url = "http://" + hostport
+		}
+	}
 	return &httpAnalysisService{
 		url: strings.TrimRight(url, "/"), token: token,
 		client: &http.Client{Timeout: 5 * time.Second},
