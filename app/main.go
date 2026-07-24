@@ -501,10 +501,35 @@ func (s *Server) ensureAnalysis(session *Session) {
 }
 
 func (s *Server) handlePythonMessage(session *Session, payload []byte) {
+	var envelope struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(payload, &envelope) != nil {
+		return
+	}
+	if envelope.Type == "analysis_error" {
+		message := strings.TrimSpace(envelope.Message)
+		if message == "" {
+			message = "Moduł Python nie mógł przeanalizować klatki."
+		}
+		s.manager.mu.Lock()
+		session.AnalysisError = message
+		s.manager.mu.Unlock()
+		clean, _ := json.Marshal(map[string]string{
+			"type": "analysis_error", "message": message,
+		})
+		s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, clean}, true)
+		return
+	}
+
 	var result AnalysisMessage
 	if json.Unmarshal(payload, &result) != nil || result.Type != "analysis" {
 		return
 	}
+	s.manager.mu.Lock()
+	session.AnalysisError = ""
+	s.manager.mu.Unlock()
 	if result.Detected && !validAngles(result.Angles) {
 		return
 	}
