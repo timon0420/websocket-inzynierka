@@ -12,7 +12,7 @@ import (
 )
 
 type analysisService interface {
-	Analyze(sessionID string, jpeg []byte) (AnalysisData, error)
+	Analyze(sessionCode string, jpeg []byte) (AnalysisData, error)
 	Ready() bool
 }
 
@@ -33,7 +33,7 @@ func newHTTPAnalysisService(url, token string) analysisService {
 	}
 }
 
-func (s *httpAnalysisService) Analyze(sessionID string, jpeg []byte) (AnalysisData, error) {
+func (s *httpAnalysisService) Analyze(sessionCode string, jpeg []byte) (AnalysisData, error) {
 	if s.url == "" {
 		return AnalysisData{}, errors.New("ANALYSIS_SERVICE_URL is not configured")
 	}
@@ -42,7 +42,7 @@ func (s *httpAnalysisService) Analyze(sessionID string, jpeg []byte) (AnalysisDa
 		return AnalysisData{}, err
 	}
 	request.Header.Set("Content-Type", "image/jpeg")
-	request.Header.Set("X-Session-ID", sessionID)
+	request.Header.Set("X-Session-Code", sessionCode)
 	request.Header.Set("X-Internal-Token", s.token)
 	response, err := s.client.Do(request)
 	if err != nil {

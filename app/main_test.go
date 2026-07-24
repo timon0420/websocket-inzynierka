@@ -26,11 +26,11 @@ type fakeAnalyzer struct {
 
 func (f *fakeAnalyzer) Ready() bool { return true }
 
-func (f *fakeAnalyzer) Analyze(sessionID string, jpeg []byte) (AnalysisData, error) {
+func (f *fakeAnalyzer) Analyze(sessionCode string, jpeg []byte) (AnalysisData, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.frames[sessionID] = append(f.frames[sessionID], append([]byte(nil), jpeg...))
-	return f.results[sessionID], nil
+	f.frames[sessionCode] = append(f.frames[sessionCode], append([]byte(nil), jpeg...))
+	return f.results[sessionCode], nil
 }
 
 func createTestSession(t *testing.T, url string) sessionResponse {
@@ -101,8 +101,7 @@ func TestJPEGIsAnalyzedAndAnglesReachBrowserAndUnity(t *testing.T) {
 	server := httptest.NewServer(control.routes())
 	defer server.Close()
 	session := createTestSession(t, server.URL)
-	sessionID := control.manager.codes[session.Code].ID
-	analyzer.results[sessionID] = AnalysisData{
+	analyzer.results[session.Code] = AnalysisData{
 		Detected: true, Angles: []float64{10, 20, 30, 40, 50, 60}, ProcessingMS: 12.5,
 	}
 	unityToken := pairTestRole(t, server.URL, session.Code, roleUnity)
@@ -128,8 +127,8 @@ func TestJPEGIsAnalyzedAndAnglesReachBrowserAndUnity(t *testing.T) {
 	}
 	analyzer.mu.Lock()
 	defer analyzer.mu.Unlock()
-	if len(analyzer.frames[sessionID]) != 1 || !bytes.Equal(analyzer.frames[sessionID][0], jpeg) {
-		t.Fatal("analyzer did not receive the browser JPEG")
+	if len(analyzer.frames[session.Code]) != 1 || !bytes.Equal(analyzer.frames[session.Code][0], jpeg) {
+		t.Fatal("analyzer did not receive the browser JPEG with the public session code")
 	}
 }
 
@@ -155,6 +154,36 @@ func TestNoDetectionDoesNotSendAnglesToUnity(t *testing.T) {
 	}
 }
 
+func TestSessionsUseIndependentAnalysisState(t *testing.T) {
+	analyzer := &fakeAnalyzer{results: make(map[string]AnalysisData), frames: make(map[string][][]byte)}
+	control := newServerWithAnalyzer(analyzer)
+	server := httptest.NewServer(control.routes())
+	defer server.Close()
+
+	first := createTestSession(t, server.URL)
+	second := createTestSession(t, server.URL)
+	analyzer.results[first.Code] = AnalysisData{Detected: true, Angles: []float64{1, 2, 3, 4, 5, 6}}
+	analyzer.results[second.Code] = AnalysisData{Detected: true, Angles: []float64{11, 12, 13, 14, 15, 16}}
+
+	firstBrowser := dialRole(t, server.URL, roleBrowser, first.BrowserToken)
+	secondBrowser := dialRole(t, server.URL, roleBrowser, second.BrowserToken)
+	firstUnity := dialRole(t, server.URL, roleUnity, pairTestRole(t, server.URL, first.Code, roleUnity))
+	secondUnity := dialRole(t, server.URL, roleUnity, pairTestRole(t, server.URL, second.Code, roleUnity))
+	defer firstBrowser.Close()
+	defer secondBrowser.Close()
+	defer firstUnity.Close()
+	defer secondUnity.Close()
+
+	_ = firstBrowser.WriteMessage(websocket.BinaryMessage, []byte{0xff, 0xd8, 0x01, 0xff, 0xd9})
+	_ = secondBrowser.WriteMessage(websocket.BinaryMessage, []byte{0xff, 0xd8, 0x02, 0xff, 0xd9})
+	var firstAngles, secondAngles GestureData
+	_ = json.Unmarshal(readType(t, firstUnity, "angles"), &firstAngles)
+	_ = json.Unmarshal(readType(t, secondUnity, "angles"), &secondAngles)
+	if firstAngles.Angles[5] != 6 || secondAngles.Angles[5] != 16 {
+		t.Fatalf("sessions crossed: first=%v second=%v", firstAngles.Angles, secondAngles.Angles)
+	}
+}
+
 func TestOnlyUnityCanBePaired(t *testing.T) {
 	server := httptest.NewServer(newServerWithAnalyzer(&fakeAnalyzer{}).routes())
 	defer server.Close()
@@ -169,6 +198,29 @@ func TestOnlyUnityCanBePaired(t *testing.T) {
 		bytes.NewReader([]byte(`{"code":"`+session.Code+`","role":"unity"}`)))
 	if response.StatusCode != http.StatusConflict {
 		t.Fatalf("duplicate Unity role status: %d", response.StatusCode)
+	}
+}
+
+func TestHTTPAnalysisServiceSendsPublicSessionCode(t *testing.T) {
+	var receivedCode, receivedToken string
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedCode = r.Header.Get("X-Session-Code")
+		receivedToken = r.Header.Get("X-Internal-Token")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"detected":false,"processingMs":3.5}`))
+	}))
+	defer worker.Close()
+
+	service := newHTTPAnalysisService(worker.URL, "internal-secret")
+	result, err := service.Analyze("ABCD-EFGH", []byte{0xff, 0xd8, 0xff, 0xd9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receivedCode != "ABCD-EFGH" || receivedToken != "internal-secret" {
+		t.Fatalf("unexpected internal headers: code=%q token=%q", receivedCode, receivedToken)
+	}
+	if result.Detected || result.ProcessingMS != 3.5 {
+		t.Fatalf("unexpected analysis result: %+v", result)
 	}
 }
 

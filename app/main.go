@@ -459,7 +459,7 @@ func (s *Server) queueAnalysis(session *Session, jpeg []byte) {
 
 func (s *Server) analysisLoop(session *Session, frame []byte) {
 	for {
-		result, err := s.analyzer.Analyze(session.ID, frame)
+		result, err := s.analyzer.Analyze(session.Code, frame)
 		if err != nil {
 			payload, _ := json.Marshal(map[string]any{
 				"type": "analysis_error", "message": "Analiza obrazu jest chwilowo niedostępna.",
