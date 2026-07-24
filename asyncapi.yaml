@@ -1,9 +1,8 @@
 asyncapi: 3.0.0
 info:
   title: Session Manipulator Streaming API
-  version: 3.0.0
-  description: Sesyjny transport obrazu z przeglądarki i kątów obliczanych przez backend do Unity.
-
+  version: 4.0.0
+  description: Izolowany transport browser-Python-Unity dla wielu sesji.
 servers:
   local:
     host: localhost:8080
@@ -11,13 +10,9 @@ servers:
   production:
     host: websocket-inzynierka.onrender.com
     protocol: wss
-
 channels:
   browser:
     address: /ws/browser?token={token}
-    parameters:
-      token:
-        description: Token przeglądarki zwrócony przez POST /api/sessions.
     messages:
       jpegFrame:
         $ref: '#/components/messages/JpegFrame'
@@ -25,44 +20,45 @@ channels:
         $ref: '#/components/messages/Status'
       analysis:
         $ref: '#/components/messages/Analysis'
-      analysisError:
-        $ref: '#/components/messages/AnalysisError'
+  python:
+    address: /ws/python?token={token}
+    messages:
+      jpegFrame:
+        $ref: '#/components/messages/JpegFrame'
+      analysis:
+        $ref: '#/components/messages/Analysis'
   unity:
     address: /ws/unity?token={token}
-    parameters:
-      token:
-        description: Token roli unity zwrócony przez POST /api/sessions/pair.
     messages:
       angles:
         $ref: '#/components/messages/Angles'
-
 operations:
   browserSendsJPEG:
     action: send
-    channel:
-      $ref: '#/channels/browser'
+    channel: { $ref: '#/channels/browser' }
     messages:
-      - $ref: '#/channels/browser/messages/jpegFrame'
-  browserReceivesStatus:
+      - { $ref: '#/channels/browser/messages/jpegFrame' }
+  pythonReceivesJPEG:
     action: receive
-    channel:
-      $ref: '#/channels/browser'
+    channel: { $ref: '#/channels/python' }
     messages:
-      - $ref: '#/channels/browser/messages/status'
+      - { $ref: '#/channels/python/messages/jpegFrame' }
+  pythonSendsAnalysis:
+    action: send
+    channel: { $ref: '#/channels/python' }
+    messages:
+      - { $ref: '#/channels/python/messages/analysis' }
   browserReceivesAnalysis:
     action: receive
-    channel:
-      $ref: '#/channels/browser'
+    channel: { $ref: '#/channels/browser' }
     messages:
-      - $ref: '#/channels/browser/messages/analysis'
-      - $ref: '#/channels/browser/messages/analysisError'
+      - { $ref: '#/channels/browser/messages/analysis' }
+      - { $ref: '#/channels/browser/messages/status' }
   unityReceivesAngles:
     action: receive
-    channel:
-      $ref: '#/channels/unity'
+    channel: { $ref: '#/channels/unity' }
     messages:
-      - $ref: '#/channels/unity/messages/angles'
-
+      - { $ref: '#/channels/unity/messages/angles' }
 components:
   messages:
     JpegFrame:
@@ -72,80 +68,49 @@ components:
         type: string
         format: binary
         maxLength: 204800
-    Angles:
-      name: Angles
-      contentType: application/json
-      payload:
-        $ref: '#/components/schemas/AnglesPayload'
     Analysis:
       name: Analysis
       contentType: application/json
-      payload:
-        $ref: '#/components/schemas/AnalysisPayload'
-    AnalysisError:
-      name: AnalysisError
+      payload: { $ref: '#/components/schemas/AnalysisPayload' }
+    Angles:
+      name: Angles
       contentType: application/json
-      payload:
-        type: object
-        required: [type, message]
-        properties:
-          type:
-            const: analysis_error
-          message:
-            type: string
+      payload: { $ref: '#/components/schemas/AnglesPayload' }
     Status:
       name: Status
       contentType: application/json
       payload:
         type: object
-        required: [type, analysis, unity]
+        required: [type, analysis, python, unity]
         properties:
-          type:
-            const: status
-          analysis:
-            enum: [ready, unavailable]
-          unity:
-            type: boolean
-
+          type: { const: status }
+          analysis: { enum: [ready, unavailable] }
+          analysisError: { type: string }
+          python: { type: boolean }
+          unity: { type: boolean }
   schemas:
     AnalysisPayload:
       type: object
-      required: [type, detected, processingMs, sequence]
+      required: [type, detected, processingMs]
       properties:
-        type:
-          const: analysis
-        detected:
-          type: boolean
+        type: { const: analysis }
+        detected: { type: boolean }
         angles:
           type: array
           minItems: 6
           maxItems: 6
-          items:
-            type: number
-            minimum: 0
-            maximum: 180
-        processingMs:
-          type: number
-          minimum: 0
-        sequence:
-          type: integer
-          minimum: 1
+          items: { type: number, minimum: 0, maximum: 180 }
+        processingMs: { type: number, minimum: 0 }
+        sequence: { type: integer, minimum: 0 }
     AnglesPayload:
       type: object
       required: [type, angles, timestamp, sequence]
       properties:
-        type:
-          const: angles
+        type: { const: angles }
         angles:
           type: array
           minItems: 6
           maxItems: 6
-          items:
-            type: number
-            minimum: 0
-            maximum: 180
-        timestamp:
-          type: number
-        sequence:
-          type: integer
-          minimum: 1
+          items: { type: number, minimum: 0, maximum: 180 }
+        timestamp: { type: number }
+        sequence: { type: integer, minimum: 1 }

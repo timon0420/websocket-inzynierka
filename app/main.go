@@ -19,6 +19,7 @@ import (
 
 const (
 	roleBrowser         = "browser"
+	rolePython          = "python"
 	roleUnity           = "unity"
 	maxJPEGSize         = 200 * 1024
 	pairingTTL          = 15 * time.Minute
@@ -72,6 +73,8 @@ type Session struct {
 	Paired         map[string]bool
 	Clients        map[string]*client
 	LastSequence   uint64
+	LastActivation time.Time
+	AnalysisError  string
 }
 
 type SessionManager struct {
@@ -108,19 +111,24 @@ func (m *SessionManager) create(now time.Time) (*Session, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	pythonToken, err := randomToken(32)
+	if err != nil {
+		return nil, "", err
+	}
 	session := &Session{
 		ID:             id,
 		Code:           code,
 		CreatedAt:      now,
 		PairingExpires: now.Add(pairingTTL),
 		LastActive:     now,
-		Tokens:         map[string]string{roleBrowser: browserToken},
-		Paired:         map[string]bool{roleBrowser: true},
+		Tokens:         map[string]string{roleBrowser: browserToken, rolePython: pythonToken},
+		Paired:         map[string]bool{roleBrowser: true, rolePython: true},
 		Clients:        make(map[string]*client),
 	}
 	m.sessions[id] = session
 	m.codes[code] = session
 	m.tokens[browserToken] = session
+	m.tokens[pythonToken] = session
 	return session, browserToken, nil
 }
 
@@ -163,6 +171,9 @@ func (m *SessionManager) register(session *Session, role string, c *client) *cli
 	defer m.mu.Unlock()
 	previous := session.Clients[role]
 	session.Clients[role] = c
+	if role == rolePython {
+		session.AnalysisError = ""
+	}
 	session.LastActive = time.Now()
 	return previous
 }
@@ -210,9 +221,10 @@ func (m *SessionManager) nextSequence(session *Session) uint64 {
 	return session.LastSequence
 }
 
-func (m *SessionManager) cleanup(now time.Time) {
+func (m *SessionManager) cleanup(now time.Time) []*Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var removed []*Session
 	for id, session := range m.sessions {
 		noClients := len(session.Clients) == 0
 		if now.Sub(session.CreatedAt) < maxSessionAge && (!noClients || now.Sub(session.LastActive) < disconnectedTTL) {
@@ -223,7 +235,9 @@ func (m *SessionManager) cleanup(now time.Time) {
 		}
 		delete(m.codes, session.Code)
 		delete(m.sessions, id)
+		removed = append(removed, session)
 	}
+	return removed
 }
 
 func (m *SessionManager) uniqueCodeLocked() (string, error) {
@@ -266,14 +280,11 @@ type rateEntry struct {
 }
 
 type Server struct {
-	manager       *SessionManager
-	upgrader      websocket.Upgrader
-	rateMu        sync.Mutex
-	pairRate      map[string]rateEntry
-	analyzer      analysisService
-	analysisMu    sync.Mutex
-	analysisBusy  map[string]bool
-	pendingFrames map[string][]byte
+	manager  *SessionManager
+	upgrader websocket.Upgrader
+	rateMu   sync.Mutex
+	pairRate map[string]rateEntry
+	analyzer analysisService
 }
 
 func newServer() *Server {
@@ -289,12 +300,10 @@ func newServerWithAnalyzer(analyzer analysisService) *Server {
 		manager: newSessionManager(),
 		upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
-			return allowedOrigin == "" || origin == "" || origin == allowedOrigin
+			return allowedOrigin == "" || allowedOrigin == "*" || origin == "" || origin == allowedOrigin
 		}},
-		pairRate:      make(map[string]rateEntry),
-		analyzer:      analyzer,
-		analysisBusy:  make(map[string]bool),
-		pendingFrames: make(map[string][]byte),
+		pairRate: make(map[string]rateEntry),
+		analyzer: analyzer,
 	}
 }
 
@@ -303,6 +312,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/sessions/pair", s.handlePair)
 	mux.HandleFunc("/ws/browser", func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(roleBrowser, w, r) })
+	mux.HandleFunc("/ws/python", func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(rolePython, w, r) })
 	mux.HandleFunc("/ws/unity", func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(roleUnity, w, r) })
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	return cors(mux)
@@ -335,6 +345,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	go s.ensureAnalysis(session)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"code":         session.Code,
 		"browserToken": token,
@@ -404,6 +415,9 @@ func (s *Server) handleWebSocket(role string, w http.ResponseWriter, r *http.Req
 		return
 	}
 	queueSize := 8
+	if role == rolePython {
+		queueSize = 1
+	}
 	c := &client{conn: conn, send: make(chan outboundMessage, queueSize)}
 	previous := s.manager.register(session, role, c)
 	if previous != nil {
@@ -413,6 +427,9 @@ func (s *Server) handleWebSocket(role string, w http.ResponseWriter, r *http.Req
 		s.manager.unregister(session, role, c)
 		_ = conn.Close()
 		s.sendStatus(session)
+		if role == rolePython {
+			time.AfterFunc(5*time.Second, func() { go s.ensureAnalysis(session) })
+		}
 	}()
 
 	conn.SetReadLimit(maxJPEGSize + 1024)
@@ -439,59 +456,67 @@ func (s *Server) handleWebSocket(role string, w http.ResponseWriter, r *http.Req
 				continue
 			}
 			lastFrame = now
-			s.queueAnalysis(session, payload)
+			if !s.manager.route(session, rolePython, outboundMessage{websocket.BinaryMessage, payload}, true) {
+				go s.ensureAnalysis(session)
+			}
+		case rolePython:
+			if messageType == websocket.TextMessage {
+				s.handlePythonMessage(session, payload)
+			}
 		}
 	}
 }
 
-func (s *Server) queueAnalysis(session *Session, jpeg []byte) {
-	frame := append([]byte(nil), jpeg...)
-	s.analysisMu.Lock()
-	if s.analysisBusy[session.ID] {
-		s.pendingFrames[session.ID] = frame
-		s.analysisMu.Unlock()
+func (s *Server) ensureAnalysis(session *Session) {
+	s.manager.mu.Lock()
+	if time.Since(session.LastActivation) < 5*time.Second {
+		s.manager.mu.Unlock()
 		return
 	}
-	s.analysisBusy[session.ID] = true
-	s.analysisMu.Unlock()
-	go s.analysisLoop(session, frame)
+	session.LastActivation = time.Now()
+	token := session.Tokens[rolePython]
+	s.manager.mu.Unlock()
+	retryDelay := 5 * time.Second
+	if err := s.analyzer.Activate(session.Code, token, session.CreatedAt.Add(maxSessionAge)); err != nil {
+		message := "Analiza obrazu jest chwilowo niedostępna."
+		if strings.Contains(err.Error(), "capacity_exceeded") {
+			message = "Brak wolnego miejsca w usłudze analizy."
+			retryDelay = 30 * time.Second
+		}
+		s.manager.mu.Lock()
+		session.AnalysisError = message
+		s.manager.mu.Unlock()
+		payload, _ := json.Marshal(map[string]any{"type": "analysis_error", "message": message})
+		s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, payload}, true)
+	}
+	time.AfterFunc(retryDelay, func() {
+		s.manager.mu.RLock()
+		active := s.manager.sessions[session.ID] == session
+		connected := session.Clients[rolePython] != nil
+		s.manager.mu.RUnlock()
+		if active && !connected {
+			go s.ensureAnalysis(session)
+		}
+	})
 }
 
-func (s *Server) analysisLoop(session *Session, frame []byte) {
-	for {
-		result, err := s.analyzer.Analyze(session.Code, frame)
-		if err != nil {
-			payload, _ := json.Marshal(map[string]any{
-				"type": "analysis_error", "message": "Analiza obrazu jest chwilowo niedostępna.",
-			})
-			s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, payload}, true)
-		} else {
-			sequence := s.manager.nextSequence(session)
-			browserMessage := AnalysisMessage{
-				Type: "analysis", Detected: result.Detected, Angles: result.Angles,
-				ProcessingMS: result.ProcessingMS, Sequence: sequence,
-			}
-			payload, _ := json.Marshal(browserMessage)
-			s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, payload}, true)
-			if result.Detected && validAngles(result.Angles) {
-				unityMessage, _ := json.Marshal(GestureData{
-					Type: "angles", Angles: result.Angles,
-					Timestamp: float64(time.Now().UnixMilli()) / 1000, Sequence: sequence,
-				})
-				s.manager.route(session, roleUnity, outboundMessage{websocket.TextMessage, unityMessage}, true)
-			}
-		}
-
-		s.analysisMu.Lock()
-		next := s.pendingFrames[session.ID]
-		delete(s.pendingFrames, session.ID)
-		if next == nil {
-			delete(s.analysisBusy, session.ID)
-			s.analysisMu.Unlock()
-			return
-		}
-		s.analysisMu.Unlock()
-		frame = next
+func (s *Server) handlePythonMessage(session *Session, payload []byte) {
+	var result AnalysisMessage
+	if json.Unmarshal(payload, &result) != nil || result.Type != "analysis" {
+		return
+	}
+	if result.Detected && !validAngles(result.Angles) {
+		return
+	}
+	result.Sequence = s.manager.nextSequence(session)
+	clean, _ := json.Marshal(result)
+	s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, clean}, true)
+	if result.Detected {
+		angles, _ := json.Marshal(GestureData{
+			Type: "angles", Angles: result.Angles,
+			Timestamp: float64(time.Now().UnixMilli()) / 1000, Sequence: result.Sequence,
+		})
+		s.manager.route(session, roleUnity, outboundMessage{websocket.TextMessage, angles}, true)
 	}
 }
 
@@ -516,14 +541,17 @@ func (s *Server) writePump(c *client) {
 
 func (s *Server) sendStatus(session *Session) {
 	s.manager.mu.RLock()
+	pythonConnected := session.Clients[rolePython] != nil
 	unityConnected := session.Clients[roleUnity] != nil
+	analysisError := session.AnalysisError
 	s.manager.mu.RUnlock()
 	analysisStatus := "unavailable"
-	if s.analyzer.Ready() {
+	if pythonConnected {
 		analysisStatus = "ready"
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"type": "status", "analysis": analysisStatus, "unity": unityConnected,
+		"type": "status", "analysis": analysisStatus, "analysisError": analysisError,
+		"python": pythonConnected, "unity": unityConnected,
 	})
 	s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, payload}, true)
 }
@@ -560,7 +588,9 @@ func main() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for now := range ticker.C {
-			server.manager.cleanup(now)
+			for _, session := range server.manager.cleanup(now) {
+				go server.analyzer.Deactivate(session.Code)
+			}
 		}
 	}()
 	port := os.Getenv("PORT")
