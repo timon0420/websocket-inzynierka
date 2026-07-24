@@ -1,8 +1,8 @@
 asyncapi: 3.0.0
 info:
   title: Session Manipulator Streaming API
-  version: 2.0.0
-  description: Sesyjny transport obrazu browser-Python i kątów Python-Unity.
+  version: 3.0.0
+  description: Sesyjny transport obrazu z przeglądarki i kątów obliczanych przez backend do Unity.
 
 servers:
   local:
@@ -17,24 +17,16 @@ channels:
     address: /ws/browser?token={token}
     parameters:
       token:
-        description: Token browsera zwrócony przez POST /api/sessions.
+        description: Token przeglądarki zwrócony przez POST /api/sessions.
     messages:
       jpegFrame:
         $ref: '#/components/messages/JpegFrame'
       status:
         $ref: '#/components/messages/Status'
-  python:
-    address: /ws/python?token={token}
-    parameters:
-      token:
-        description: Token roli python zwrócony przez POST /api/sessions/pair.
-    messages:
-      jpegFrame:
-        $ref: '#/components/messages/JpegFrame'
-      angles:
-        $ref: '#/components/messages/Angles'
-      source:
-        $ref: '#/components/messages/Source'
+      analysis:
+        $ref: '#/components/messages/Analysis'
+      analysisError:
+        $ref: '#/components/messages/AnalysisError'
   unity:
     address: /ws/unity?token={token}
     parameters:
@@ -57,24 +49,13 @@ operations:
       $ref: '#/channels/browser'
     messages:
       - $ref: '#/channels/browser/messages/status'
-  pythonReceivesJPEG:
+  browserReceivesAnalysis:
     action: receive
     channel:
-      $ref: '#/channels/python'
+      $ref: '#/channels/browser'
     messages:
-      - $ref: '#/channels/python/messages/jpegFrame'
-  pythonSendsAngles:
-    action: send
-    channel:
-      $ref: '#/channels/python'
-    messages:
-      - $ref: '#/channels/python/messages/angles'
-  pythonSelectsSource:
-    action: send
-    channel:
-      $ref: '#/channels/python'
-    messages:
-      - $ref: '#/channels/python/messages/source'
+      - $ref: '#/channels/browser/messages/analysis'
+      - $ref: '#/channels/browser/messages/analysisError'
   unityReceivesAngles:
     action: receive
     channel:
@@ -96,34 +77,59 @@ components:
       contentType: application/json
       payload:
         $ref: '#/components/schemas/AnglesPayload'
-    Source:
-      name: Source
+    Analysis:
+      name: Analysis
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/AnalysisPayload'
+    AnalysisError:
+      name: AnalysisError
       contentType: application/json
       payload:
         type: object
-        required: [type, source]
+        required: [type, message]
         properties:
           type:
-            const: source
-          source:
-            enum: [local_camera, web_camera]
+            const: analysis_error
+          message:
+            type: string
     Status:
       name: Status
       contentType: application/json
       payload:
         type: object
-        required: [type, python, unity, source]
+        required: [type, analysis, unity]
         properties:
           type:
             const: status
-          python:
-            type: boolean
+          analysis:
+            enum: [ready, unavailable]
           unity:
             type: boolean
-          source:
-            type: string
 
   schemas:
+    AnalysisPayload:
+      type: object
+      required: [type, detected, processingMs, sequence]
+      properties:
+        type:
+          const: analysis
+        detected:
+          type: boolean
+        angles:
+          type: array
+          minItems: 6
+          maxItems: 6
+          items:
+            type: number
+            minimum: 0
+            maximum: 180
+        processingMs:
+          type: number
+          minimum: 0
+        sequence:
+          type: integer
+          minimum: 1
     AnglesPayload:
       type: object
       required: [type, angles, timestamp, sequence]

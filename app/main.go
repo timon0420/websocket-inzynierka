@@ -19,7 +19,6 @@ import (
 
 const (
 	roleBrowser         = "browser"
-	rolePython          = "python"
 	roleUnity           = "unity"
 	maxJPEGSize         = 200 * 1024
 	pairingTTL          = 15 * time.Minute
@@ -39,9 +38,18 @@ type GestureData struct {
 	Sequence  uint64    `json:"sequence"`
 }
 
-type sourceMessage struct {
-	Type   string `json:"type"`
-	Source string `json:"source"`
+type AnalysisData struct {
+	Detected     bool      `json:"detected"`
+	Angles       []float64 `json:"angles,omitempty"`
+	ProcessingMS float64   `json:"processingMs"`
+}
+
+type AnalysisMessage struct {
+	Type         string    `json:"type"`
+	Detected     bool      `json:"detected"`
+	Angles       []float64 `json:"angles,omitempty"`
+	ProcessingMS float64   `json:"processingMs"`
+	Sequence     uint64    `json:"sequence"`
 }
 
 type outboundMessage struct {
@@ -63,7 +71,6 @@ type Session struct {
 	Tokens         map[string]string
 	Paired         map[string]bool
 	Clients        map[string]*client
-	Source         string
 	LastSequence   uint64
 }
 
@@ -120,7 +127,7 @@ func (m *SessionManager) create(now time.Time) (*Session, string, error) {
 func (m *SessionManager) pair(code, role string, now time.Time) (*Session, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if role != rolePython && role != roleUnity {
+	if role != roleUnity {
 		return nil, "", errors.New("invalid_role")
 	}
 	session := m.codes[normalizeCode(code)]
@@ -195,34 +202,12 @@ func (m *SessionManager) route(session *Session, role string, message outboundMe
 	}
 }
 
-func (m *SessionManager) status(session *Session) []byte {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	payload, _ := json.Marshal(map[string]any{
-		"type":   "status",
-		"python": session.Clients[rolePython] != nil,
-		"unity":  session.Clients[roleUnity] != nil,
-		"source": session.Source,
-	})
-	return payload
-}
-
-func (m *SessionManager) setSource(session *Session, source string) {
+func (m *SessionManager) nextSequence(session *Session) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	session.Source = source
+	session.LastSequence++
 	session.LastActive = time.Now()
-}
-
-func (m *SessionManager) acceptSequence(session *Session, sequence uint64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if sequence <= session.LastSequence {
-		return false
-	}
-	session.LastSequence = sequence
-	session.LastActive = time.Now()
-	return true
+	return session.LastSequence
 }
 
 func (m *SessionManager) cleanup(now time.Time) {
@@ -281,13 +266,24 @@ type rateEntry struct {
 }
 
 type Server struct {
-	manager  *SessionManager
-	upgrader websocket.Upgrader
-	rateMu   sync.Mutex
-	pairRate map[string]rateEntry
+	manager       *SessionManager
+	upgrader      websocket.Upgrader
+	rateMu        sync.Mutex
+	pairRate      map[string]rateEntry
+	analyzer      analysisService
+	analysisMu    sync.Mutex
+	analysisBusy  map[string]bool
+	pendingFrames map[string][]byte
 }
 
 func newServer() *Server {
+	return newServerWithAnalyzer(newHTTPAnalysisService(
+		os.Getenv("ANALYSIS_SERVICE_URL"),
+		os.Getenv("INTERNAL_SERVICE_TOKEN"),
+	))
+}
+
+func newServerWithAnalyzer(analyzer analysisService) *Server {
 	allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
 	return &Server{
 		manager: newSessionManager(),
@@ -295,7 +291,10 @@ func newServer() *Server {
 			origin := r.Header.Get("Origin")
 			return allowedOrigin == "" || origin == "" || origin == allowedOrigin
 		}},
-		pairRate: make(map[string]rateEntry),
+		pairRate:      make(map[string]rateEntry),
+		analyzer:      analyzer,
+		analysisBusy:  make(map[string]bool),
+		pendingFrames: make(map[string][]byte),
 	}
 }
 
@@ -304,7 +303,6 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/sessions", s.handleSessions)
 	mux.HandleFunc("/api/sessions/pair", s.handlePair)
 	mux.HandleFunc("/ws/browser", func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(roleBrowser, w, r) })
-	mux.HandleFunc("/ws/python", func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(rolePython, w, r) })
 	mux.HandleFunc("/ws/unity", func(w http.ResponseWriter, r *http.Request) { s.handleWebSocket(roleUnity, w, r) })
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	return cors(mux)
@@ -406,9 +404,6 @@ func (s *Server) handleWebSocket(role string, w http.ResponseWriter, r *http.Req
 		return
 	}
 	queueSize := 8
-	if role == rolePython {
-		queueSize = 1
-	}
 	c := &client{conn: conn, send: make(chan outboundMessage, queueSize)}
 	previous := s.manager.register(session, role, c)
 	if previous != nil {
@@ -444,38 +439,59 @@ func (s *Server) handleWebSocket(role string, w http.ResponseWriter, r *http.Req
 				continue
 			}
 			lastFrame = now
-			s.manager.route(session, rolePython, outboundMessage{websocket.BinaryMessage, payload}, true)
-		case rolePython:
-			if messageType != websocket.TextMessage {
-				continue
-			}
-			s.handlePythonMessage(session, payload)
+			s.queueAnalysis(session, payload)
 		}
 	}
 }
 
-func (s *Server) handlePythonMessage(session *Session, payload []byte) {
-	var envelope struct {
-		Type string `json:"type"`
-	}
-	if json.Unmarshal(payload, &envelope) != nil {
+func (s *Server) queueAnalysis(session *Session, jpeg []byte) {
+	frame := append([]byte(nil), jpeg...)
+	s.analysisMu.Lock()
+	if s.analysisBusy[session.ID] {
+		s.pendingFrames[session.ID] = frame
+		s.analysisMu.Unlock()
 		return
 	}
-	switch envelope.Type {
-	case "source":
-		var message sourceMessage
-		if json.Unmarshal(payload, &message) != nil || (message.Source != "web_camera" && message.Source != "local_camera") {
+	s.analysisBusy[session.ID] = true
+	s.analysisMu.Unlock()
+	go s.analysisLoop(session, frame)
+}
+
+func (s *Server) analysisLoop(session *Session, frame []byte) {
+	for {
+		result, err := s.analyzer.Analyze(session.ID, frame)
+		if err != nil {
+			payload, _ := json.Marshal(map[string]any{
+				"type": "analysis_error", "message": "Analiza obrazu jest chwilowo niedostępna.",
+			})
+			s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, payload}, true)
+		} else {
+			sequence := s.manager.nextSequence(session)
+			browserMessage := AnalysisMessage{
+				Type: "analysis", Detected: result.Detected, Angles: result.Angles,
+				ProcessingMS: result.ProcessingMS, Sequence: sequence,
+			}
+			payload, _ := json.Marshal(browserMessage)
+			s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, payload}, true)
+			if result.Detected && validAngles(result.Angles) {
+				unityMessage, _ := json.Marshal(GestureData{
+					Type: "angles", Angles: result.Angles,
+					Timestamp: float64(time.Now().UnixMilli()) / 1000, Sequence: sequence,
+				})
+				s.manager.route(session, roleUnity, outboundMessage{websocket.TextMessage, unityMessage}, true)
+			}
+		}
+
+		s.analysisMu.Lock()
+		next := s.pendingFrames[session.ID]
+		delete(s.pendingFrames, session.ID)
+		if next == nil {
+			delete(s.analysisBusy, session.ID)
+			s.analysisMu.Unlock()
 			return
 		}
-		s.manager.setSource(session, message.Source)
-		s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, s.manager.status(session)}, false)
-	case "angles":
-		var data GestureData
-		if json.Unmarshal(payload, &data) != nil || !validAngles(data.Angles) || !s.manager.acceptSequence(session, data.Sequence) {
-			return
-		}
-		clean, _ := json.Marshal(data)
-		s.manager.route(session, roleUnity, outboundMessage{websocket.TextMessage, clean}, true)
+		s.analysisMu.Unlock()
+		frame = next
 	}
 }
 
@@ -499,7 +515,17 @@ func (s *Server) writePump(c *client) {
 }
 
 func (s *Server) sendStatus(session *Session) {
-	s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, s.manager.status(session)}, true)
+	s.manager.mu.RLock()
+	unityConnected := session.Clients[roleUnity] != nil
+	s.manager.mu.RUnlock()
+	analysisStatus := "unavailable"
+	if s.analyzer.Ready() {
+		analysisStatus = "ready"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"type": "status", "analysis": analysisStatus, "unity": unityConnected,
+	})
+	s.manager.route(session, roleBrowser, outboundMessage{websocket.TextMessage, payload}, true)
 }
 
 func validAngles(angles []float64) bool {

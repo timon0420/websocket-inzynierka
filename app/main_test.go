@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,21 @@ import (
 type sessionResponse struct {
 	Code         string `json:"code"`
 	BrowserToken string `json:"browserToken"`
+}
+
+type fakeAnalyzer struct {
+	mu      sync.Mutex
+	results map[string]AnalysisData
+	frames  map[string][][]byte
+}
+
+func (f *fakeAnalyzer) Ready() bool { return true }
+
+func (f *fakeAnalyzer) Analyze(sessionID string, jpeg []byte) (AnalysisData, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.frames[sessionID] = append(f.frames[sessionID], append([]byte(nil), jpeg...))
+	return f.results[sessionID], nil
 }
 
 func createTestSession(t *testing.T, url string) sessionResponse {
@@ -59,83 +75,100 @@ func dialRole(t *testing.T, baseURL, role, token string) *websocket.Conn {
 	return conn
 }
 
-func TestSessionRoutesJPEGAndAnglesWithinOneSession(t *testing.T) {
-	server := httptest.NewServer(newServer().routes())
+func readType(t *testing.T, conn *websocket.Conn, wanted string) []byte {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(payload, &envelope)
+		if envelope.Type == wanted {
+			return payload
+		}
+	}
+}
+
+func TestJPEGIsAnalyzedAndAnglesReachBrowserAndUnity(t *testing.T) {
+	analyzer := &fakeAnalyzer{
+		results: make(map[string]AnalysisData), frames: make(map[string][][]byte),
+	}
+	control := newServerWithAnalyzer(analyzer)
+	server := httptest.NewServer(control.routes())
 	defer server.Close()
 	session := createTestSession(t, server.URL)
-	pythonToken := pairTestRole(t, server.URL, session.Code, rolePython)
+	sessionID := control.manager.codes[session.Code].ID
+	analyzer.results[sessionID] = AnalysisData{
+		Detected: true, Angles: []float64{10, 20, 30, 40, 50, 60}, ProcessingMS: 12.5,
+	}
 	unityToken := pairTestRole(t, server.URL, session.Code, roleUnity)
 	browser := dialRole(t, server.URL, roleBrowser, session.BrowserToken)
-	python := dialRole(t, server.URL, rolePython, pythonToken)
 	unity := dialRole(t, server.URL, roleUnity, unityToken)
 	defer browser.Close()
-	defer python.Close()
 	defer unity.Close()
 
 	jpeg := []byte{0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9}
 	if err := browser.WriteMessage(websocket.BinaryMessage, jpeg); err != nil {
 		t.Fatal(err)
 	}
-	_ = python.SetReadDeadline(time.Now().Add(2 * time.Second))
-	messageType, received, err := python.ReadMessage()
-	if err != nil || messageType != websocket.BinaryMessage || !bytes.Equal(received, jpeg) {
-		t.Fatalf("python JPEG: type=%d payload=%v err=%v", messageType, received, err)
-	}
 
-	angles := GestureData{Type: "angles", Angles: []float64{10, 20, 30, 40, 50, 60}, Timestamp: 1.5, Sequence: 1}
-	if err := python.WriteJSON(angles); err != nil {
-		t.Fatal(err)
+	var analysis AnalysisMessage
+	_ = json.Unmarshal(readType(t, browser, "analysis"), &analysis)
+	if !analysis.Detected || analysis.Angles[5] != 60 || analysis.ProcessingMS != 12.5 {
+		t.Fatalf("unexpected browser analysis: %+v", analysis)
 	}
-	_ = unity.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, payload, err := unity.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
+	var angles GestureData
+	_ = json.Unmarshal(readType(t, unity, "angles"), &angles)
+	if angles.Sequence != analysis.Sequence || angles.Angles[5] != 60 {
+		t.Fatalf("unexpected Unity angles: %+v", angles)
 	}
-	var receivedAngles GestureData
-	_ = json.Unmarshal(payload, &receivedAngles)
-	if receivedAngles.Sequence != 1 || receivedAngles.Angles[5] != 60 {
-		t.Fatalf("unexpected angles: %+v", receivedAngles)
+	analyzer.mu.Lock()
+	defer analyzer.mu.Unlock()
+	if len(analyzer.frames[sessionID]) != 1 || !bytes.Equal(analyzer.frames[sessionID][0], jpeg) {
+		t.Fatal("analyzer did not receive the browser JPEG")
 	}
 }
 
-func TestSessionsAreIsolated(t *testing.T) {
-	server := httptest.NewServer(newServer().routes())
-	defer server.Close()
-	a := createTestSession(t, server.URL)
-	b := createTestSession(t, server.URL)
-	pythonA := dialRole(t, server.URL, rolePython, pairTestRole(t, server.URL, a.Code, rolePython))
-	pythonB := dialRole(t, server.URL, rolePython, pairTestRole(t, server.URL, b.Code, rolePython))
-	browserA := dialRole(t, server.URL, roleBrowser, a.BrowserToken)
-	defer pythonA.Close()
-	defer pythonB.Close()
-	defer browserA.Close()
-
-	jpeg := []byte{0xff, 0xd8, 0x42, 0xff, 0xd9}
-	_ = browserA.WriteMessage(websocket.BinaryMessage, jpeg)
-	_ = pythonA.SetReadDeadline(time.Now().Add(time.Second))
-	if _, _, err := pythonA.ReadMessage(); err != nil {
-		t.Fatalf("session A did not receive JPEG: %v", err)
-	}
-	_ = pythonB.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
-	if _, _, err := pythonB.ReadMessage(); err == nil {
-		t.Fatal("session B received session A JPEG")
-	}
-}
-
-func TestPairingRejectsDuplicateRoleAndInvalidCode(t *testing.T) {
-	server := httptest.NewServer(newServer().routes())
+func TestNoDetectionDoesNotSendAnglesToUnity(t *testing.T) {
+	analyzer := &fakeAnalyzer{results: make(map[string]AnalysisData), frames: make(map[string][][]byte)}
+	control := newServerWithAnalyzer(analyzer)
+	server := httptest.NewServer(control.routes())
 	defer server.Close()
 	session := createTestSession(t, server.URL)
-	_ = pairTestRole(t, server.URL, session.Code, rolePython)
-	body, _ := json.Marshal(map[string]string{"code": session.Code, "role": rolePython})
-	response, _ := http.Post(server.URL+"/api/sessions/pair", "application/json", bytes.NewReader(body))
-	if response.StatusCode != http.StatusConflict {
-		t.Fatalf("duplicate role status: %d", response.StatusCode)
+	unity := dialRole(t, server.URL, roleUnity, pairTestRole(t, server.URL, session.Code, roleUnity))
+	browser := dialRole(t, server.URL, roleBrowser, session.BrowserToken)
+	defer unity.Close()
+	defer browser.Close()
+	_ = browser.WriteMessage(websocket.BinaryMessage, []byte{0xff, 0xd8, 0xff, 0xd9})
+	var analysis AnalysisMessage
+	_ = json.Unmarshal(readType(t, browser, "analysis"), &analysis)
+	if analysis.Detected {
+		t.Fatal("no detection was reported as detected")
 	}
-	body, _ = json.Marshal(map[string]string{"code": "BAD-CODE", "role": roleUnity})
-	response, _ = http.Post(server.URL+"/api/sessions/pair", "application/json", bytes.NewReader(body))
+	_ = unity.SetReadDeadline(time.Now().Add(150 * time.Millisecond))
+	if _, _, err := unity.ReadMessage(); err == nil {
+		t.Fatal("Unity received angles without a detected hand")
+	}
+}
+
+func TestOnlyUnityCanBePaired(t *testing.T) {
+	server := httptest.NewServer(newServerWithAnalyzer(&fakeAnalyzer{}).routes())
+	defer server.Close()
+	session := createTestSession(t, server.URL)
+	body, _ := json.Marshal(map[string]string{"code": session.Code, "role": "python"})
+	response, _ := http.Post(server.URL+"/api/sessions/pair", "application/json", bytes.NewReader(body))
 	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid code status: %d", response.StatusCode)
+		t.Fatalf("python role status: %d", response.StatusCode)
+	}
+	_ = pairTestRole(t, server.URL, session.Code, roleUnity)
+	response, _ = http.Post(server.URL+"/api/sessions/pair", "application/json",
+		bytes.NewReader([]byte(`{"code":"`+session.Code+`","role":"unity"}`)))
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate Unity role status: %d", response.StatusCode)
 	}
 }
 
